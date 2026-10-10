@@ -1,0 +1,2074 @@
+**********************
+PowerShell transcript start
+Start time: 20261003200506
+Username: DESKTOP-3S5LN80\William Anthony
+RunAs User: DESKTOP-3S5LN80\William Anthony
+Configuration Name: 
+Machine: DESKTOP-3S5LN80 (Microsoft Windows NT 10.0.26200.0)
+Host Application: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\pwsh.dll
+Process ID: 28768
+PSVersion: 7.6.6
+PSEdition: Core
+GitCommitId: 7.6.6
+OS: Microsoft Windows 10.0.26200
+Platform: Win32NT
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1, 6.0, 7.0
+PSRemotingProtocolVersion: 2.4
+SerializationVersion: 1.1.0.1
+WSManStackVersion: 3.0
+**********************
+PS C:\Users\William Anthony\Downloads> function HexByte([int]$x) {
+    return ("{0:X2}" -f ($x -band 0xFF))
+}
+PS C:\Users\William Anthony\Downloads> function HexBytes([byte[]]$x) {
+    if ($null -eq $x -or $x.Length -eq 0) { return "" }
+    return (($x | ForEach-Object { "{0:X2}" -f $_ }) -join " ")
+}
+PS C:\Users\William Anthony\Downloads> function U16LE([byte[]]$b,[int]$p) {
+    if ($p + 1 -ge $b.Length) { return $null }
+    return (([int]$b[$p]) -bor (([int]$b[$p+1]) -shl 8))
+}
+PS C:\Users\William Anthony\Downloads> function U16BE([byte[]]$b,[int]$p) {
+    if ($p + 1 -ge $b.Length) { return $null }
+    return ((([int]$b[$p]) -shl 8) -bor [int]$b[$p+1])
+}
+PS C:\Users\William Anthony\Downloads> function Get-DeviceDescription([string]$comPort) {
+    try {
+        $esc = $comPort.Replace('\','\\')
+        $items = Get-CimInstance Win32_PnPEntity |
+                 Where-Object {
+                    $_.Name -and ($_.Name -match "\($([regex]::Escape($comPort))\)")
+                 }
+        if ($items) { return (($items | Select-Object -First 3 -ExpandProperty Name) -join " | ") }
+    } catch {}
+    return "unknown"
+}
+PS C:\Users\William Anthony\Downloads> function CaptureSerial {
+    param(
+        [string]$Device,
+        [int]$BaudRate,
+        [ValidateSet("None","Even","Odd")]
+        [string]$Parity = "None",
+        [double]$CaptureSeconds = 1.0
+    )
+
+    $sp = New-Object System.IO.Ports.SerialPort
+    $sp.PortName = $Device
+    $sp.BaudRate = $BaudRate
+    $sp.DataBits = 8
+    $sp.StopBits = [System.IO.Ports.StopBits]::One
+    $sp.Handshake = [System.IO.Ports.Handshake]::None
+    $sp.ReadTimeout = 50
+    $sp.DtrEnable = $false
+    $sp.RtsEnable = $false
+
+    switch ($Parity) {
+        "None" { $sp.Parity = [System.IO.Ports.Parity]::None }
+        "Even" { $sp.Parity = [System.IO.Ports.Parity]::Even }
+        "Odd"  { $sp.Parity = [System.IO.Ports.Parity]::Odd }
+    }
+
+    $buf = New-Object System.Collections.Generic.List[byte]
+    try {
+        $sp.Open()
+        Start-Sleep -Milliseconds 100
+        try { $sp.DiscardInBuffer() } catch {}
+
+        $deadline = (Get-Date).AddSeconds($CaptureSeconds)
+        $tmp = New-Object byte[] 8192
+
+        while ((Get-Date) -lt $deadline) {
+            try {
+                $n = $sp.Read($tmp,0,$tmp.Length)
+                if ($n -gt 0) {
+                    for ($i=0; $i -lt $n; $i++) {
+                        [void]$buf.Add($tmp[$i])
+                    }
+                }
+            } catch [System.TimeoutException] {}
+        }
+        return [byte[]]$buf.ToArray()
+    }
+    finally {
+        if ($sp.IsOpen) { $sp.Close() }
+        $sp.Dispose()
+    }
+}
+PS C:\Users\William Anthony\Downloads> function CountPair([byte[]]$Data,[int]$A,[int]$B) {
+    $n = 0
+    for ($i=0; $i -lt ($Data.Length-1); $i++) {
+        if ($Data[$i] -eq $A -and $Data[$i+1] -eq $B) { $n++ }
+    }
+    return $n
+}
+PS C:\Users\William Anthony\Downloads> # Official RRC:
+PS C:\Users\William Anthony\Downloads> # AA 55 Function Length Data CRC
+PS C:\Users\William Anthony\Downloads> function ParseRRC([byte[]]$Data) {
+    $out = New-Object System.Collections.Generic.List[object]
+    $i = 0
+    while ($i -lt ($Data.Length - 4)) {
+        if ($Data[$i] -eq 0xAA -and $Data[$i+1] -eq 0x55) {
+            $func = [int]$Data[$i+2]
+            $len  = [int]$Data[$i+3]
+            $total = 5 + $len
+
+            if ($len -le 250 -and ($i + $total) -le $Data.Length) {
+                if ($len -gt 0) {
+                    [byte[]]$payload = [byte[]]$Data[($i+4)..($i+3+$len)]
+                } else {
+                    [byte[]]$payload = [byte[]]@()
+                }
+
+                $crc = [int]$Data[$i+4+$len]
+
+                [void]$out.Add([pscustomobject]@{
+                    Offset   = $i
+                    Function = $func
+                    Length   = $len
+                    Payload  = $payload
+                    CRC      = $crc
+                    Raw      = [byte[]]$Data[$i..($i+$total-1)]
+                })
+
+                $i += $total
+                continue
+            }
+        }
+        $i++
+    }
+    return @($out)
+}
+PS C:\Users\William Anthony\Downloads> # CRC-8, polynomial 0x07, init 0, xorout 0
+PS C:\Users\William Anthony\Downloads> # This is tested as one candidate; official JetAuto docs define the CRC
+PS C:\Users\William Anthony\Downloads> # input as Function + Length + Data and the low 8 bits, but do not publish
+PS C:\Users\William Anthony\Downloads> # the polynomial in the page used here.
+PS C:\Users\William Anthony\Downloads> function CRC8Poly07([byte[]]$Data) {
+    $crc = 0
+    foreach ($b in $Data) {
+        $crc = ($crc -bxor [int]$b) -band 0xFF
+        for ($k=0; $k -lt 8; $k++) {
+            if (($crc -band 0x80) -ne 0) {
+                $crc = ((($crc -shl 1) -bxor 0x07) -band 0xFF)
+            } else {
+                $crc = (($crc -shl 1) -band 0xFF)
+            }
+        }
+    }
+    return $crc
+}
+PS C:\Users\William Anthony\Downloads> function RRCCrcInput($p) {
+    $tmp = New-Object System.Collections.Generic.List[byte]
+    [void]$tmp.Add([byte]$p.Function)
+    [void]$tmp.Add([byte]$p.Length)
+    foreach ($b in $p.Payload) { [void]$tmp.Add([byte]$b) }
+    return [byte[]]$tmp.ToArray()
+}
+PS C:\Users\William Anthony\Downloads> function CheckRRC_CRC([object[]]$Packets) {
+    $matches = 0
+    foreach ($p in $Packets) {
+        $calc = CRC8Poly07 (RRCCrcInput $p)
+        if ($calc -eq $p.CRC) { $matches++ }
+    }
+
+    $ratio = 0
+    if ($Packets.Count -gt 0) {
+        $ratio = [Math]::Round($matches / [double]$Packets.Count,3)
+    }
+
+    return [pscustomobject]@{
+        Samples = $Packets.Count
+        Matches = $matches
+        Ratio   = $ratio
+    }
+}
+PS C:\Users\William Anthony\Downloads> function ByteStats([byte[]]$Data) {
+    $freq = New-Object int[] 256
+    foreach ($b in $Data) { $freq[[int]$b]++ }
+
+    $unique = 0
+    foreach ($x in $freq) { if ($x -gt 0) { $unique++ } }
+
+    [pscustomobject]@{
+        Bytes = $Data.Length
+        Unique = $unique
+        AA55 = CountPair $Data 0xAA 0x55
+        0CFC = CountPair $Data 0x0C 0xFC
+        04FE = CountPair $Data 0x04 0xFE
+    }
+At line:8 char:23
++     [pscustomobject]@{
++                       ~
+Missing closing '}' in statement block or type definition.
+
+At line:12 char:9
++         0CFC = CountPair $Data 0x0C 0xFC
++         ~~~~
+Unexpected token '0CFC' in expression or statement.
+ParserError: 
+Line |
+   8 |      [pscustomobject]@{
+     |                        ~
+     | Missing closing '}' in statement block or type definition.
+
+PS C:\Users\William Anthony\Downloads> }
+At line:1 char:1
++ }
++ ~
+Unexpected token '}' in expression or statement.
+ParserError: 
+Line |
+   1 |  }
+     |  ~
+     | Unexpected token '}' in expression or statement.
+
+PS C:\Users\William Anthony\Downloads> function TopPairs([byte[]]$Data) {
+    $h = @{}
+    for ($i=0;$i -lt ($Data.Length-1);$i++) {
+        $k = "{0:X2} {1:X2}" -f $Data[$i],$Data[$i+1]
+        if (-not $h.ContainsKey($k)) { $h[$k] = 0 }
+        $h[$k]++
+    }
+    return @(
+        $h.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Select-Object -First 50 |
+        ForEach-Object {
+            [pscustomobject]@{ Pair=$_.Key; Count=$_.Value }
+        }
+    )
+}
+PS C:\Users\William Anthony\Downloads> # Discover candidate [2-byte sync][length byte] structures.
+PS C:\Users\William Anthony\Downloads> function FindUnknownModels([byte[]]$Data) {
+    $pairs = @(TopPairs $Data | Select-Object -First 25)
+    $models = New-Object System.Collections.Generic.List[object]
+
+    foreach ($pair in $pairs) {
+        $q = $pair.Pair.Split(" ")
+        $h0 = [Convert]::ToInt32($q[0],16)
+        $h1 = [Convert]::ToInt32($q[1],16)
+
+        foreach ($lenPos in 2,3,4,5) {
+            $hits = 0
+            $valid = 0
+            $next = 0
+            $examples = @()
+
+            for ($i=0;$i -lt ($Data.Length-8);$i++) {
+                if ($Data[$i] -ne $h0 -or $Data[$i+1] -ne $h1) { continue }
+                $hits++
+
+                if ($i+$lenPos -ge $Data.Length) { continue }
+                $L = [int]$Data[$i+$lenPos]
+                if ($L -gt 200) { continue }
+
+                # Assume length is payload length.
+                $total = $lenPos + 2 + $L
+                if ($total -lt 4 -or $i+$total -gt $Data.Length) { continue }
+
+                $valid++
+                if ($i+$total+1 -lt $Data.Length -and
+                    $Data[$i+$total] -eq $h0 -and
+                    $Data[$i+$total+1] -eq $h1) {
+                    $next++
+                }
+
+                if ($examples.Count -lt 3) { $examples += $L }
+            }
+
+            if ($hits -ge 3) {
+                $vr = [Math]::Round($valid/[double]$hits,3)
+                $cr = 0
+                if ($valid -gt 1) {
+                    $cr = [Math]::Round($next/[double]($valid-1),3)
+                }
+
+                $score = [Math]::Round(100*(0.55*$vr + 0.45*$cr),1)
+
+                [void]$models.Add([pscustomobject]@{
+                    Header = $pair.Pair
+                    LenPos = $lenPos
+                    Hits = $hits
+                    Valid = $valid
+                    NextHeader = $next
+                    ValidRatio = $vr
+                    Continuity = $cr
+                    Score = $score
+                    ExampleLengths = ($examples -join ",")
+                })
+            }
+        }
+    }
+
+    return @(
+        $models |
+        Sort-Object Score -Descending |
+        Select-Object -First 20
+    )
+}
+PS C:\Users\William Anthony\Downloads> function ParseUnknownModel([byte[]]$Data,$Model) {
+    $q=$Model.Header.Split(" ")
+    $h0=[Convert]::ToInt32($q[0],16)
+    $h1=[Convert]::ToInt32($q[1],16)
+
+    $frames=New-Object System.Collections.Generic.List[object]
+    for($i=0;$i -lt ($Data.Length-8);$i++){
+        if($Data[$i] -ne $h0 -or $Data[$i+1] -ne $h1){continue}
+        $L=[int]$Data[$i+$Model.LenPos]
+        if($L -gt 200){continue}
+        $total=$Model.LenPos+2+$L
+        if($i+$total -gt $Data.Length){continue}
+
+        [void]$frames.Add([pscustomobject]@{
+            Offset=$i
+            LengthField=$L
+            Total=$total
+            Bytes=[byte[]]$Data[$i..($i+$total-1)]
+        })
+        $i += ($total-1)
+    }
+    return @($frames)
+}
+PS C:\Users\William Anthony\Downloads> function FieldTable([object[]]$Frames) {
+    if ($Frames.Count -lt 3) { return @() }
+
+    $max = 0
+    foreach($f in $Frames){ if($f.Bytes.Length -gt $max){$max=$f.Bytes.Length} }
+
+    $rows=New-Object System.Collections.Generic.List[object]
+
+    for($p=0;$p -lt $max;$p++){
+        $v=@()
+        foreach($f in $Frames){
+            if($p -lt $f.Bytes.Length){$v += [int]$f.Bytes[$p]}
+        }
+        if($v.Count -lt 3){continue}
+
+        $uniq=@($v | Sort-Object -Unique).Count
+        $min=($v|Measure-Object -Minimum).Minimum
+        $maxv=($v|Measure-Object -Maximum).Maximum
+
+        $le=@()
+        $be=@()
+        foreach($f in $Frames){
+            if($p+1 -lt $f.Bytes.Length){
+                $le += U16LE $f.Bytes $p
+                $be += U16BE $f.Bytes $p
+            }
+        }
+
+        $constValue = ""
+        if ($uniq -eq 1) {
+            $constValue = HexByte $v[0]
+        }
+
+        [void]$rows.Add([pscustomobject]@{
+            Pos=$p
+            Samples=$v.Count
+            Distinct=$uniq
+            Min=$min
+            Max=$maxv
+            Constant=($uniq -eq 1)
+            ConstValue=$constValue
+            U16LE_Min=($le|Measure-Object -Minimum).Minimum
+            U16LE_Max=($le|Measure-Object -Maximum).Maximum
+            U16BE_Min=($be|Measure-Object -Minimum).Minimum
+            U16BE_Max=($be|Measure-Object -Maximum).Maximum
+        })
+    }
+    return @($rows)
+}
+PS C:\Users\William Anthony\Downloads> function CompareActionFrames([object[]]$BaseFrames,[object[]]$ActFrames) {
+    $n=[Math]::Min($BaseFrames.Count,$ActFrames.Count)
+    if($n -lt 2){return @()}
+
+    $max=0
+    for($i=0;$i -lt $n;$i++){
+        $max=[Math]::Max($max,[Math]::Min($BaseFrames[$i].Bytes.Length,$ActFrames[$i].Bytes.Length))
+    }
+
+    $out=New-Object System.Collections.Generic.List[object]
+    for($p=0;$p -lt $max;$p++){
+        $changed=0
+        $examples=@()
+
+        for($i=0;$i -lt $n;$i++){
+            $a=$BaseFrames[$i].Bytes
+            $b=$ActFrames[$i].Bytes
+            if($p -lt $a.Length -and $p -lt $b.Length -and $a[$p] -ne $b[$p]){
+                $changed++
+                if($examples.Count -lt 5){
+                    $examples += ("{0:X2}->{1:X2}" -f $a[$p],$b[$p])
+                }
+            }
+        }
+
+        if($changed -gt 0){
+            [void]$out.Add([pscustomobject]@{
+                Position=$p
+                Changed=$changed
+                Total=$n
+                Fraction=[Math]::Round($changed/[double]$n,3)
+                Examples=($examples -join ", ")
+            })
+        }
+    }
+
+    return @($out | Sort-Object Fraction -Descending)
+}
+PS C:\Users\William Anthony\Downloads> clear
+PS C:\Users\William Anthony\Downloads> @'
+#requires -Version 5.1
+[CmdletBinding()]
+param(
+    [string]$Port = "COM9",
+    [int]$Baud = 0,
+    [double]$ScanSeconds = 1.0,
+    [double]$DeepSeconds = 8.0,
+    [switch]$NoActions,
+    [string]$OutDir = ".\jetauto_uart_final"
+)
+
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# Fixed test plan
+# -----------------------------
+$BaudPlan = @(115200,230400,460800,921600,1000000,1500000,2000000,3000000,4000000)
+if ($Baud -gt 0) { $BaudPlan = @($Baud) }
+
+if ($ScanSeconds -le 0) { $ScanSeconds = 1.0 }
+if ($DeepSeconds -le 0) { $DeepSeconds = 8.0 }
+
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$Report = Join-Path $OutDir "report.txt"
+
+function H([int]$b) {
+    "{0:X2}" -f ($b -band 255)
+}
+
+function HX([byte[]]$b) {
+    if ($null -eq $b -or $b.Length -eq 0) { return "" }
+    (($b | ForEach-Object { "{0:X2}" -f $_ }) -join " ")
+}
+
+function CountPair([byte[]]$Data,[int]$A,[int]$B) {
+    $n = 0
+    for ($i=0; $i -lt $Data.Length-1; $i++) {
+        if ($Data[$i] -eq $A -and $Data[$i+1] -eq $B) { $n++ }
+    }
+    $n
+}
+
+function Get-DeviceName([string]$Com) {
+    try {
+        $escaped = [regex]::Escape($Com)
+        $x = Get-CimInstance Win32_PnPEntity |
+            Where-Object { $_.Name -and $_.Name -match "\($escaped\)$" } |
+            Select-Object -First 1 -ExpandProperty Name
+        if ($x) { return $x }
+    } catch {}
+    "unknown"
+}
+
+function Capture-Serial {
+    param(
+        [string]$Device,
+        [int]$Rate,
+        [string]$ParityName,
+        [double]$Seconds
+    )
+
+    $sp = New-Object System.IO.Ports.SerialPort
+    $sp.PortName = $Device
+    $sp.BaudRate = $Rate
+    $sp.DataBits = 8
+    $sp.StopBits = [System.IO.Ports.StopBits]::One
+    $sp.Handshake = [System.IO.Ports.Handshake]::None
+    $sp.ReadTimeout = 50
+
+    # Keep these off so we do not intentionally toggle/reset the target.
+    $sp.DtrEnable = $false
+    $sp.RtsEnable = $false
+
+    if ($ParityName -eq "None") { $sp.Parity = [System.IO.Ports.Parity]::None }
+    elseif ($ParityName -eq "Even") { $sp.Parity = [System.IO.Ports.Parity]::Even }
+    elseif ($ParityName -eq "Odd") { $sp.Parity = [System.IO.Ports.Parity]::Odd }
+    else { throw "Unsupported parity: $ParityName" }
+
+    $buf = New-Object System.Collections.Generic.List[byte]
+
+    try {
+        $sp.Open()
+        Start-Sleep -Milliseconds 100
+        try { $sp.DiscardInBuffer() } catch {}
+
+        $tmp = New-Object byte[] 8192
+        $until = (Get-Date).AddSeconds($Seconds)
+
+        while ((Get-Date) -lt $until) {
+            try {
+                $n = $sp.Read($tmp,0,$tmp.Length)
+                if ($n -gt 0) {
+                    for ($i=0; $i -lt $n; $i++) { [void]$buf.Add($tmp[$i]) }
+                }
+            } catch [System.TimeoutException] {}
+        }
+
+        return [byte[]]$buf.ToArray()
+    }
+    finally {
+        if ($sp.IsOpen) { $sp.Close() }
+        $sp.Dispose()
+    }
+}
+
+# Official documented RRC layout:
+# AA 55 | Function | Length | Data[Length] | CRC
+function Parse-RRC([byte[]]$Data) {
+    $packets = New-Object System.Collections.Generic.List[object]
+
+    for ($i=0; $i -lt $Data.Length-4; $i++) {
+        if ($Data[$i] -ne 0xAA -or $Data[$i+1] -ne 0x55) { continue }
+
+        $func = [int]$Data[$i+2]
+        $len = [int]$Data[$i+3]
+        $total = 5 + $len
+
+        if ($len -gt 250) { continue }
+        if ($i + $total -gt $Data.Length) { continue }
+
+        $payload = [byte[]]@()
+        if ($len -gt 0) {
+            $payload = [byte[]]$Data[($i+4)..($i+3+$len)]
+        }
+
+        $crc = [int]$Data[$i+4+$len]
+
+        [void]$packets.Add([pscustomobject]@{
+            Offset = $i
+            Function = $func
+            Length = $len
+            Payload = $payload
+            CRC = $crc
+            Raw = [byte[]]$Data[$i..($i+$total-1)]
+        })
+
+        $i += $total-1
+    }
+
+    @($packets)
+}
+
+function CRC8-07([byte[]]$Data) {
+    $crc = 0
+    foreach ($b in $Data) {
+        $crc = ($crc -bxor [int]$b) -band 255
+        for ($k=0; $k -lt 8; $k++) {
+            if (($crc -band 0x80) -ne 0) {
+                $crc = ((($crc -shl 1) -bxor 0x07) -band 255)
+            } else {
+                $crc = (($crc -shl 1) -band 255)
+            }
+        }
+    }
+    $crc
+}
+
+function RRC-CRCInput($p) {
+    $x = New-Object System.Collections.Generic.List[byte]
+    [void]$x.Add([byte]$p.Function)
+    [void]$x.Add([byte]$p.Length)
+    foreach ($b in $p.Payload) { [void]$x.Add([byte]$b) }
+    [byte[]]$x.ToArray()
+}
+
+function CRC-MatchRate([object[]]$Packets) {
+    $matches = 0
+    foreach ($p in $Packets) {
+        if ((CRC8-07 (RRC-CRCInput $p)) -eq $p.CRC) { $matches++ }
+    }
+    [pscustomobject]@{
+        Samples = $Packets.Count
+        Matches = $matches
+        Ratio = if ($Packets.Count -gt 0) {
+            [Math]::Round($matches / [double]$Packets.Count,3)
+        } else { 0 }
+    }
+}
+
+function Top-Pairs([byte[]]$Data) {
+    $d = @{}
+    for ($i=0; $i -lt $Data.Length-1; $i++) {
+        $k = "{0:X2} {1:X2}" -f $Data[$i],$Data[$i+1]
+        if (-not $d.ContainsKey($k)) { $d[$k] = 0 }
+        $d[$k]++
+    }
+
+    @(
+        $d.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Select-Object -First 50 |
+        ForEach-Object {
+            [pscustomobject]@{
+                Pair = $_.Key
+                Count = $_.Value
+            }
+        }
+    )
+}
+
+function Stats([byte[]]$Data) {
+    $u = @{}
+    foreach ($b in $Data) { $u[[int]$b] = 1 }
+
+    [pscustomobject]@{
+        Bytes = $Data.Length
+        Unique = $u.Count
+        AA55 = CountPair $Data 0xAA 0x55
+        CFC = CountPair $Data 0x0C 0xFC
+        EFE = CountPair $Data 0x04 0xFE
+    }
+}
+
+# Find repeated 2-byte header + 1-byte length candidates.
+function Find-UnknownModels([byte[]]$Data) {
+    $pairs = @(Top-Pairs $Data | Select-Object -First 30)
+    $models = New-Object System.Collections.Generic.List[object]
+
+    foreach ($pair in $pairs) {
+        $parts = $pair.Pair.Split(" ")
+        $h0 = [Convert]::ToInt32($parts[0],16)
+        $h1 = [Convert]::ToInt32($parts[1],16)
+
+        foreach ($lenPos in @(2,3,4,5)) {
+            $hits = 0
+            $valid = 0
+            $next = 0
+            $examples = New-Object System.Collections.Generic.List[int]
+
+            for ($i=0; $i -lt $Data.Length-8; $i++) {
+                if ($Data[$i] -ne $h0 -or $Data[$i+1] -ne $h1) { continue }
+                $hits++
+
+                $L = [int]$Data[$i+$lenPos]
+                if ($L -gt 200) { continue }
+
+                # Interpret length byte as payload length.
+                $total = $lenPos + 2 + $L
+
+                if ($i+$total -gt $Data.Length) { continue }
+                $valid++
+
+                if ($i+$total+1 -lt $Data.Length -and
+                    $Data[$i+$total] -eq $h0 -and
+                    $Data[$i+$total+1] -eq $h1) {
+                    $next++
+                }
+
+                if ($examples.Count -lt 5) { [void]$examples.Add($L) }
+            }
+
+            if ($hits -ge 3) {
+                $validRatio = [Math]::Round($valid/[double]$hits,3)
+                if ($valid -gt 1) {
+                    $continuity = [Math]::Round($next/[double]($valid-1),3)
+                } else {
+                    $continuity = 0
+                }
+
+                $score = [Math]::Round(
+                    100 * (0.55*$validRatio + 0.45*$continuity),1
+                )
+
+                [void]$models.Add([pscustomobject]@{
+                    Header = $pair.Pair
+                    LenPos = $lenPos
+                    Hits = $hits
+                    Valid = $valid
+                    NextHeader = $next
+                    ValidRatio = $validRatio
+                    Continuity = $continuity
+                    Score = $score
+                    ExampleLengths = ($examples -join ",")
+                })
+            }
+        }
+    }
+
+    @(
+        $models |
+        Sort-Object Score -Descending |
+        Select-Object -First 20
+    )
+}
+
+function Parse-Unknown([byte[]]$Data,$Model) {
+    $parts = $Model.Header.Split(" ")
+    $h0 = [Convert]::ToInt32($parts[0],16)
+    $h1 = [Convert]::ToInt32($parts[1],16)
+
+    $frames = New-Object System.Collections.Generic.List[object]
+
+    for ($i=0; $i -lt $Data.Length-8; $i++) {
+        if ($Data[$i] -ne $h0 -or $Data[$i+1] -ne $h1) { continue }
+
+        $L = [int]$Data[$i+$Model.LenPos]
+        if ($L -gt 200) { continue }
+
+        $total = $Model.LenPos + 2 + $L
+        if ($i+$total -gt $Data.Length) { continue }
+
+        [void]$frames.Add([pscustomobject]@{
+            Offset = $i
+            LengthField = $L
+            Total = $total
+            Bytes = [byte[]]$Data[$i..($i+$total-1)]
+        })
+
+        $i += $total-1
+    }
+
+    @($frames)
+}
+
+function Field-Stats([object[]]$Frames) {
+    if ($Frames.Count -lt 3) { return @() }
+
+    $maxLen = 0
+    foreach ($f in $Frames) {
+        if ($f.Bytes.Length -gt $maxLen) { $maxLen = $f.Bytes.Length }
+    }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    for ($pos=0; $pos -lt $maxLen; $pos++) {
+        $vals = @()
+
+        foreach ($f in $Frames) {
+            if ($pos -lt $f.Bytes.Length) { $vals += [int]$f.Bytes[$pos] }
+        }
+
+        if ($vals.Count -lt 3) { continue }
+
+        $distinct = @($vals | Sort-Object -Unique).Count
+        $min = ($vals | Measure-Object -Minimum).Minimum
+        $max = ($vals | Measure-Object -Maximum).Maximum
+
+        $le = @()
+        $be = @()
+
+        foreach ($f in $Frames) {
+            if ($pos+1 -lt $f.Bytes.Length) {
+                $le += ([int]$f.Bytes[$pos]) -bor (([int]$f.Bytes[$pos+1]) -shl 8)
+                $be += (([int]$f.Bytes[$pos] -shl 8) -bor [int]$f.Bytes[$pos+1])
+            }
+        }
+
+        $constant = ($distinct -eq 1)
+        $constText = ""
+        if ($constant) { $constText = H $vals[0] }
+
+        [void]$rows.Add([pscustomobject]@{
+            Pos = $pos
+            Samples = $vals.Count
+            Distinct = $distinct
+            Min = $min
+            Max = $max
+            Constant = $constant
+            ConstValue = $constText
+            U16LE_Min = ($le | Measure-Object -Minimum).Minimum
+            U16LE_Max = ($le | Measure-Object -Maximum).Maximum
+            U16BE_Min = ($be | Measure-Object -Minimum).Minimum
+            U16BE_Max = ($be | Measure-Object -Maximum).Maximum
+        })
+    }
+
+    @($rows)
+}
+
+function Compare-Frames([object[]]$Base,[object[]]$Action) {
+    $n = [Math]::Min($Base.Count,$Action.Count)
+    if ($n -lt 2) { return @() }
+
+    $maxLen = 0
+    for ($i=0; $i -lt $n; $i++) {
+        $m = [Math]::Min($Base[$i].Bytes.Length,$Action[$i].Bytes.Length)
+        if ($m -gt $maxLen) { $maxLen = $m }
+    }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    for ($pos=0; $pos -lt $maxLen; $pos++) {
+        $changed = 0
+        $examples = New-Object System.Collections.Generic.List[string]
+
+        for ($i=0; $i -lt $n; $i++) {
+            $a = $Base[$i].Bytes
+            $b = $Action[$i].Bytes
+
+            if ($pos -lt $a.Length -and $pos -lt $b.Length -and $a[$pos] -ne $b[$pos]) {
+                $changed++
+                if ($examples.Count -lt 5) {
+                    [void]$examples.Add(("{0:X2}->{1:X2}" -f $a[$pos],$b[$pos]))
+                }
+            }
+        }
+
+        if ($changed -gt 0) {
+            [void]$rows.Add([pscustomobject]@{
+                Position = $pos
+                Changed = $changed
+                Total = $n
+                Fraction = [Math]::Round($changed/[double]$n,3)
+                Examples = ($examples -join ", ")
+            })
+        }
+    }
+
+    @($rows | Sort-Object Fraction -Descending)
+}
+
+try {
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host " JETAUTO / HIWONDER UART PASSIVE RESEARCH" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "Port      : $Port"
+    Write-Host "Device    : $(Get-DeviceName $Port)"
+    Write-Host "Bauds     : $($BaudPlan -join ', ')"
+    Write-Host "Scan time : $ScanSeconds s/profile"
+    Write-Host "Deep time : $DeepSeconds s"
+    Write-Host "Mode      : PASSIVE (RX only)"
+    Write-Host ""
+
+    $ports = [System.IO.Ports.SerialPort]::GetPortNames()
+    if ($ports -notcontains $Port) {
+        throw "COM port $Port not found. Available: $($ports -join ', ')"
+    }
+
+    # --------------------------------------------------
+    # PHASE 1: find the strongest serial profile
+    # --------------------------------------------------
+    Write-Host "PHASE 1 - SERIAL PROFILE SCAN" -ForegroundColor Cyan
+
+    $profiles = New-Object System.Collections.Generic.List[object]
+
+    foreach ($rate in $BaudPlan) {
+        foreach ($par in @("None","Even","Odd")) {
+            $parLetter = "N"
+            if ($par -eq "Even") { $parLetter = "E" }
+            elseif ($par -eq "Odd") { $parLetter = "O" }
+            Write-Host ("Testing {0} / 8{1}1..." -f $rate, $parLetter)
+
+            try {
+                [byte[]]$cap = Capture-Serial $Port $rate $par $ScanSeconds
+                $st = Stats $cap
+                $rrc = @(Parse-RRC $cap)
+                $crc = CRC-MatchRate $rrc
+
+                $rawPath = Join-Path $OutDir ("scan_{0}_{1}.raw" -f $rate,$par)
+                [IO.File]::WriteAllBytes($rawPath,$cap)
+
+                $score = ($rrc.Count*1000) + ($crc.Matches*10000) + ($st.AA55*100) + ($st.Bytes/100.0)
+
+                [void]$profiles.Add([pscustomobject]@{
+                    Baud = $rate
+                    Parity = $par
+                    Bytes = $st.Bytes
+                    AA55 = $st.AA55
+                    CFC = $st.CFC
+                    EFE = $st.EFE
+                    RRC = $rrc.Count
+                    CRC07 = $crc.Matches
+                    Score = [Math]::Round($score,2)
+                    File = $rawPath
+                })
+
+                Write-Host ("  bytes={0,6} AA55={1,4} RRC={2,4} CRC={3,4} 0CFC={4,4} 04FE={5,4} score={6}" -f `
+                    $st.Bytes,$st.AA55,$rrc.Count,$crc.Matches,$st.CFC,$st.EFE,$score)
+            }
+            catch {
+                Write-Host ("  FAILED: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+            }
+        }
+    }
+
+    if ($profiles.Count -eq 0) {
+        throw "No serial profile could be opened."
+    }
+
+    $profiles |
+        Sort-Object Score -Descending |
+        Export-Csv -NoTypeInformation -Path (Join-Path $OutDir "profiles.csv")
+
+    Write-Host ""
+    Write-Host "TOP PROFILES" -ForegroundColor Cyan
+    foreach ($p in $profiles | Sort-Object Score -Descending | Select-Object -First 15) {
+        $pLetter = "N"
+        if ($p.Parity -eq "Even") { $pLetter = "E" }
+        elseif ($p.Parity -eq "Odd") { $pLetter = "O" }
+        Write-Host ("  {0,8} 8{1}1 bytes={2,6} AA55={3,4} RRC={4,4} CRC={5,4} score={6}" -f `
+            $p.Baud,$pLetter,$p.Bytes,$p.AA55,$p.RRC,$p.CRC07,$p.Score)
+    }
+
+    # Use explicit baud if requested, otherwise best structural profile.
+    if ($Baud -gt 0) {
+        $best = $profiles |
+            Where-Object { $_.Baud -eq $Baud -and $_.Parity -eq "None" } |
+            Sort-Object Score -Descending |
+            Select-Object -First 1
+    } else {
+        $best = $profiles |
+            Sort-Object Score -Descending |
+            Select-Object -First 1
+    }
+
+    if ($null -eq $best) {
+        throw "No usable profile selected."
+    }
+
+    # --------------------------------------------------
+    # PHASE 2: deep capture
+    # --------------------------------------------------
+    Write-Host ""
+    $bestLetter = "N"
+    if ($best.Parity -eq "Even") { $bestLetter = "E" }
+    elseif ($best.Parity -eq "Odd") { $bestLetter = "O" }
+    Write-Host ("PHASE 2 - DEEP CAPTURE: {0} / 8{1}1" -f $best.Baud,$bestLetter) -ForegroundColor Cyan
+
+    [byte[]]$deep = Capture-Serial $Port ([int]$best.Baud) $best.Parity $DeepSeconds
+    $deepPath = Join-Path $OutDir "deep.raw"
+    [IO.File]::WriteAllBytes($deepPath,$deep)
+
+    Write-Host "Saved: $deepPath"
+    Write-Host "Bytes: $($deep.Length)"
+
+    if ($deep.Length -eq 0) {
+        throw "Deep capture returned zero bytes."
+    }
+
+    $st = Stats $deep
+
+    Write-Host ""
+    Write-Host "STREAM COUNTS" -ForegroundColor Cyan
+    Write-Host "  AA 55 : $($st.AA55)"
+    Write-Host "  0C FC : $($st.CFC)"
+    Write-Host "  04 FE : $($st.EFE)"
+
+    Write-Host ""
+    Write-Host "FIRST 128 BYTES" -ForegroundColor Cyan
+    $show = [Math]::Min(128,$deep.Length)
+    Write-Host (HX ([byte[]]$deep[0..($show-1)]))
+
+    # --------------------------------------------------
+    # PHASE 3: official RRC
+    # --------------------------------------------------
+    Write-Host ""
+    Write-Host "PHASE 3 - OFFICIAL HIIWONDER RRC" -ForegroundColor Cyan
+    Write-Host "Expected: AA 55 | Function | Length | Data | CRC"
+
+    $rrc = @(Parse-RRC $deep)
+    Write-Host "Complete RRC candidates: $($rrc.Count)"
+
+    if ($rrc.Count -gt 0) {
+        $crc = CRC-MatchRate $rrc
+        Write-Host ("CRC-8/poly07 matches: {0}/{1} ({2})" -f `
+            $crc.Matches,$crc.Samples,$crc.Ratio)
+
+        $rows = foreach ($p in $rrc) {
+            [pscustomobject]@{
+                Offset = $p.Offset
+                Function = ("0x{0:X2}" -f $p.Function)
+                Length = $p.Length
+                Payload = HX $p.Payload
+                CRC = ("0x{0:X2}" -f $p.CRC)
+                Raw = HX $p.Raw
+            }
+        }
+        $rows | Export-Csv -NoTypeInformation -Path (Join-Path $OutDir "rrc_frames.csv")
+
+        Write-Host ""
+        Write-Host "Detected RRC functions:" -ForegroundColor Cyan
+        foreach ($g in $rrc | Group-Object Function | Sort-Object Count -Descending) {
+            Write-Host ("  Function 0x{0:X2} : {1} packet(s)" -f [int]$g.Name,$g.Count)
+        }
+    } else {
+        Write-Host "No complete AA55 RRC packets."
+    }
+
+    # --------------------------------------------------
+    # PHASE 4: unknown framing
+    # --------------------------------------------------
+    Write-Host ""
+    Write-Host "PHASE 4 - UNKNOWN FRAME DISCOVERY" -ForegroundColor Cyan
+
+    $models = @(Find-UnknownModels $deep)
+
+    if ($models.Count -eq 0) {
+        Write-Host "No repeated 2-byte-header + length model found."
+        $bestUnknown = $null
+    } else {
+        foreach ($m in $models | Select-Object -First 15) {
+            Write-Host ("  HEADER={0} LEN@{1} hits={2} valid={3} continuity={4} score={5} lengths={6}" -f `
+                $m.Header,$m.LenPos,$m.Hits,$m.Valid,$m.Continuity,$m.Score,$m.ExampleLengths)
+        }
+
+        $bestUnknown = $models[0]
+
+        if ($bestUnknown.Score -ge 65) {
+            Write-Host ""
+            Write-Host "BEST UNKNOWN MODEL" -ForegroundColor Green
+            Write-Host "  Header : $($bestUnknown.Header)"
+            Write-Host "  Length : byte position $($bestUnknown.LenPos)"
+            Write-Host "  Score  : $($bestUnknown.Score)"
+
+            $frames = @(Parse-Unknown $deep $bestUnknown)
+
+            Write-Host "  Frames : $($frames.Count)"
+
+            if ($frames.Count -ge 3) {
+                $frameRows = foreach ($f in $frames) {
+                    [pscustomobject]@{
+                        Offset = $f.Offset
+                        LengthField = $f.LengthField
+                        Total = $f.Total
+                        Hex = HX $f.Bytes
+                    }
+                }
+                $frameRows | Export-Csv -NoTypeInformation -Path (Join-Path $OutDir "unknown_frames.csv")
+
+                Write-Host ""
+                Write-Host "DETECTED FRAMES" -ForegroundColor Cyan
+                $n = 0
+                foreach ($f in $frames | Select-Object -First 100) {
+                    $n++
+                    Write-Host ("FRAME {0,3}  offset={1,5} len={2,3}  {3}" -f `
+                        $n,$f.Offset,$f.LengthField,HX $f.Bytes)
+                }
+
+                $fields = @(Field-Stats $frames)
+                $fields | Export-Csv -NoTypeInformation -Path (Join-Path $OutDir "unknown_fields.csv")
+
+                Write-Host ""
+                Write-Host "BYTE POSITION STATISTICS" -ForegroundColor Cyan
+                Write-Host "Pos Samples Distinct Min Max Const U16LE[min..max] U16BE[min..max]"
+
+                foreach ($f in $fields) {
+                    Write-Host ("{0,3} {1,7} {2,8} {3,3} {4,3} {5,-5} {6,15} {7,15}" -f `
+                        $f.Pos,$f.Samples,$f.Distinct,$f.Min,$f.Max,$f.ConstValue, `
+                        "$($f.U16LE_Min)..$($f.U16LE_Max)", `
+                        "$($f.U16BE_Min)..$($f.U16BE_Max)")
+                }
+            }
+        }
+    }
+
+    # --------------------------------------------------
+    # PHASE 5: top pairs / old 0CFC hypothesis
+    # --------------------------------------------------
+    Write-Host ""
+    Write-Host "PHASE 5 - TOP BYTE PAIRS" -ForegroundColor Cyan
+
+    foreach ($p in Top-Pairs $deep | Select-Object -First 20) {
+        Write-Host ("  {0} = {1}" -f $p.Pair,$p.Count)
+    }
+
+    if ($st.CFC -gt 0) {
+        Write-Host ""
+        if ($st.EFE -gt ($st.CFC*2)) {
+            Write-Host "0C FC and 04 FE do NOT behave like a simple unique START/END pair in this capture." -ForegroundColor Yellow
+        } else {
+            Write-Host "0C FC / 04 FE occur, but this alone does NOT prove framing." -ForegroundColor Yellow
+        }
+    }
+
+    # --------------------------------------------------
+    # PHASE 6: controlled action experiment
+    # --------------------------------------------------
+    if (-not $NoActions) {
+        Write-Host ""
+        Write-Host "PHASE 6 - CONTROLLED ACTION EXPERIMENT" -ForegroundColor Cyan
+        Write-Host "Passive only. This script never transmits."
+
+        $run = Read-Host "Run one action experiment now? (Y/N)"
+
+        if ($run -match '^[Yy]$') {
+            $label = Read-Host "Action label (example: button_K1 / forward / left)"
+
+            Write-Host ""
+            Write-Host "Leave the robot idle."
+            [void](Read-Host "Press ENTER to capture baseline")
+
+            [byte[]]$base = Capture-Serial $Port ([int]$best.Baud) $best.Parity 3
+            [IO.File]::WriteAllBytes((Join-Path $OutDir "action_baseline.raw"),$base)
+
+            Write-Host ""
+            Write-Host "Now press ENTER, then immediately perform: $label"
+            [void](Read-Host "READY")
+
+            [byte[]]$act = Capture-Serial $Port ([int]$best.Baud) $best.Parity 3
+            [IO.File]::WriteAllBytes((Join-Path $OutDir "action.raw"),$act)
+
+            if ($null -ne $bestUnknown -and $bestUnknown.Score -ge 65) {
+                $bf = @(Parse-Unknown $base $bestUnknown)
+                $af = @(Parse-Unknown $act $bestUnknown)
+                $diff = @(Compare-Frames $bf $af)
+
+                $diff | Export-Csv -NoTypeInformation `
+                    -Path (Join-Path $OutDir "action_position_changes.csv")
+
+                Write-Host ""
+                Write-Host "POSITIONS CHANGED DURING ACTION: $label" -ForegroundColor Cyan
+                foreach ($d in $diff | Select-Object -First 40) {
+                    Write-Host ("  pos={0,3} changed={1,3}/{2,3} frac={3}  {4}" -f `
+                        $d.Position,$d.Changed,$d.Total,$d.Fraction,$d.Examples)
+                }
+            } else {
+                Write-Host "No high-confidence unknown frame model; raw baseline/action captures were saved."
+            }
+        }
+    }
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "DONE" -ForegroundColor Cyan
+    Write-Host "Artifacts: $((Resolve-Path $OutDir).Path)"
+    Write-Host "============================================================" -ForegroundColor Cyan
+}
+finally {
+    try { Stop-Transcript | Out-Null } catch {}
+}
+
+'@ | Set-Content -Encoding UTF8 .\jetauto_uart_final_PS51.ps1
+PS C:\Users\William Anthony\Downloads> Set-ExecutionPolicy -Scope Process Bypass
+PS C:\Users\William Anthony\Downloads> .\jetauto_uart_final_PS51.ps1 -Port COM9
+>> TerminatingError(): "At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:53
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                     ~
+Missing expression after ','.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:53
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                     ~~
+Unexpected token 'HX' in expression or statement.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:53
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                     ~
+Missing closing ')' in expression.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:623 char:68
++                 foreach ($f in $frames | Select-Object -First 100) {
++                                                                    ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:609 char:38
++             if ($frames.Count -ge 3) {
++                                      ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:598 char:40
++         if ($bestUnknown.Score -ge 65) {
++                                        ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:590 char:12
++     } else {
++            ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:412 char:5
++ try {
++     ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:64
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                                ~
+The Try statement is missing its Catch or Finally block.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:64
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                                ~
+Unexpected token ')' in expression or statement.
+
+Not all parse errors were reported.  Correct the reported errors and try again."
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:53
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                     ~
+Missing expression after ','.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:53
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                     ~~
+Unexpected token 'HX' in expression or statement.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:53
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                     ~
+Missing closing ')' in expression.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:623 char:68
++                 foreach ($f in $frames | Select-Object -First 100) {
++                                                                    ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:609 char:38
++             if ($frames.Count -ge 3) {
++                                      ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:598 char:40
++         if ($bestUnknown.Score -ge 65) {
++                                        ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:590 char:12
++     } else {
++            ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:412 char:5
++ try {
++     ~
+Missing closing '}' in statement block or type definition.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:64
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                                ~
+The Try statement is missing its Catch or Finally block.
+
+At C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626 char:64
++                         $n,$f.Offset,$f.LengthField,HX $f.Bytes)
++                                                                ~
+Unexpected token ')' in expression or statement.
+
+Not all parse errors were reported.  Correct the reported errors and try again.
+ParserError: C:\Users\William Anthony\Downloads\jetauto_uart_final_PS51.ps1:626
+Line |
+ 626 |                          $n,$f.Offset,$f.LengthField,HX $f.Bytes)
+     |                                                      ~
+     | Missing expression after ','.
+
+PS C:\Users\William Anthony\Downloads> clear
+PS C:\Users\William Anthony\Downloads> @'
+#requires -Version 5.1
+[CmdletBinding()]
+param(
+    [string]$Port = "COM9",
+    [int]$Baud = 0,
+    [double]$ScanSeconds = 1.0,
+    [double]$DeepSeconds = 8.0,
+    [switch]$NoActions,
+    [string]$OutDir = ".\jetauto_uart_final"
+)
+
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# Fixed test plan
+# -----------------------------
+$BaudPlan = @(115200,230400,460800,921600,1000000,1500000,2000000,3000000,4000000)
+if ($Baud -gt 0) { $BaudPlan = @($Baud) }
+
+if ($ScanSeconds -le 0) { $ScanSeconds = 1.0 }
+if ($DeepSeconds -le 0) { $DeepSeconds = 8.0 }
+
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$Report = Join-Path $OutDir "report.txt"
+
+function H([int]$b) {
+    "{0:X2}" -f ($b -band 255)
+}
+
+function HX([byte[]]$b) {
+    if ($null -eq $b -or $b.Length -eq 0) { return "" }
+    (($b | ForEach-Object { "{0:X2}" -f $_ }) -join " ")
+}
+
+function CountPair([byte[]]$Data,[int]$A,[int]$B) {
+    $n = 0
+    for ($i=0; $i -lt $Data.Length-1; $i++) {
+        if ($Data[$i] -eq $A -and $Data[$i+1] -eq $B) { $n++ }
+    }
+    $n
+}
+
+function Get-DeviceName([string]$Com) {
+    try {
+        $escaped = [regex]::Escape($Com)
+        $x = Get-CimInstance Win32_PnPEntity |
+            Where-Object { $_.Name -and $_.Name -match "\($escaped\)$" } |
+            Select-Object -First 1 -ExpandProperty Name
+        if ($x) { return $x }
+    } catch {}
+    "unknown"
+}
+
+function Capture-Serial {
+    param(
+        [string]$Device,
+        [int]$Rate,
+        [string]$ParityName,
+        [double]$Seconds
+    )
+
+    $sp = New-Object System.IO.Ports.SerialPort
+    $sp.PortName = $Device
+    $sp.BaudRate = $Rate
+    $sp.DataBits = 8
+    $sp.StopBits = [System.IO.Ports.StopBits]::One
+    $sp.Handshake = [System.IO.Ports.Handshake]::None
+    $sp.ReadTimeout = 50
+
+    # Keep these off so we do not intentionally toggle/reset the target.
+    $sp.DtrEnable = $false
+    $sp.RtsEnable = $false
+
+    if ($ParityName -eq "None") { $sp.Parity = [System.IO.Ports.Parity]::None }
+    elseif ($ParityName -eq "Even") { $sp.Parity = [System.IO.Ports.Parity]::Even }
+    elseif ($ParityName -eq "Odd") { $sp.Parity = [System.IO.Ports.Parity]::Odd }
+    else { throw "Unsupported parity: $ParityName" }
+
+    $buf = New-Object System.Collections.Generic.List[byte]
+
+    try {
+        $sp.Open()
+        Start-Sleep -Milliseconds 100
+        try { $sp.DiscardInBuffer() } catch {}
+
+        $tmp = New-Object byte[] 8192
+        $until = (Get-Date).AddSeconds($Seconds)
+
+        while ((Get-Date) -lt $until) {
+            try {
+                $n = $sp.Read($tmp,0,$tmp.Length)
+                if ($n -gt 0) {
+                    for ($i=0; $i -lt $n; $i++) { [void]$buf.Add($tmp[$i]) }
+                }
+            } catch [System.TimeoutException] {}
+        }
+
+        return [byte[]]$buf.ToArray()
+    }
+    finally {
+        if ($sp.IsOpen) { $sp.Close() }
+        $sp.Dispose()
+    }
+}
+
+# Official documented RRC layout:
+# AA 55 | Function | Length | Data[Length] | CRC
+function Parse-RRC([byte[]]$Data) {
+    $packets = New-Object System.Collections.Generic.List[object]
+
+    for ($i=0; $i -lt $Data.Length-4; $i++) {
+        if ($Data[$i] -ne 0xAA -or $Data[$i+1] -ne 0x55) { continue }
+
+        $func = [int]$Data[$i+2]
+        $len = [int]$Data[$i+3]
+        $total = 5 + $len
+
+        if ($len -gt 250) { continue }
+        if ($i + $total -gt $Data.Length) { continue }
+
+        $payload = [byte[]]@()
+        if ($len -gt 0) {
+            $payload = [byte[]]$Data[($i+4)..($i+3+$len)]
+        }
+
+        $crc = [int]$Data[$i+4+$len]
+
+        [void]$packets.Add([pscustomobject]@{
+            Offset = $i
+            Function = $func
+            Length = $len
+            Payload = $payload
+            CRC = $crc
+            Raw = [byte[]]$Data[$i..($i+$total-1)]
+        })
+
+        $i += $total-1
+    }
+
+    @($packets)
+}
+
+function CRC8-07([byte[]]$Data) {
+    $crc = 0
+    foreach ($b in $Data) {
+        $crc = ($crc -bxor [int]$b) -band 255
+        for ($k=0; $k -lt 8; $k++) {
+            if (($crc -band 0x80) -ne 0) {
+                $crc = ((($crc -shl 1) -bxor 0x07) -band 255)
+            } else {
+                $crc = (($crc -shl 1) -band 255)
+            }
+        }
+    }
+    $crc
+}
+
+function RRC-CRCInput($p) {
+    $x = New-Object System.Collections.Generic.List[byte]
+    [void]$x.Add([byte]$p.Function)
+    [void]$x.Add([byte]$p.Length)
+    foreach ($b in $p.Payload) { [void]$x.Add([byte]$b) }
+    [byte[]]$x.ToArray()
+}
+
+function CRC-MatchRate([object[]]$Packets) {
+    $matches = 0
+    foreach ($p in $Packets) {
+        if ((CRC8-07 (RRC-CRCInput $p)) -eq $p.CRC) { $matches++ }
+    }
+    [pscustomobject]@{
+        Samples = $Packets.Count
+        Matches = $matches
+        Ratio = if ($Packets.Count -gt 0) {
+            [Math]::Round($matches / [double]$Packets.Count,3)
+        } else { 0 }
+    }
+}
+
+function Top-Pairs([byte[]]$Data) {
+    $d = @{}
+    for ($i=0; $i -lt $Data.Length-1; $i++) {
+        $k = "{0:X2} {1:X2}" -f $Data[$i],$Data[$i+1]
+        if (-not $d.ContainsKey($k)) { $d[$k] = 0 }
+        $d[$k]++
+    }
+
+    @(
+        $d.GetEnumerator() |
+        Sort-Object Value -Descending |
+        Select-Object -First 50 |
+        ForEach-Object {
+            [pscustomobject]@{
+                Pair = $_.Key
+                Count = $_.Value
+            }
+        }
+    )
+}
+
+function Stats([byte[]]$Data) {
+    $u = @{}
+    foreach ($b in $Data) { $u[[int]$b] = 1 }
+
+    [pscustomobject]@{
+        Bytes = $Data.Length
+        Unique = $u.Count
+        AA55 = CountPair $Data 0xAA 0x55
+        CFC = CountPair $Data 0x0C 0xFC
+        EFE = CountPair $Data 0x04 0xFE
+    }
+}
+
+# Find repeated 2-byte header + 1-byte length candidates.
+function Find-UnknownModels([byte[]]$Data) {
+    $pairs = @(Top-Pairs $Data | Select-Object -First 30)
+    $models = New-Object System.Collections.Generic.List[object]
+
+    foreach ($pair in $pairs) {
+        $parts = $pair.Pair.Split(" ")
+        $h0 = [Convert]::ToInt32($parts[0],16)
+        $h1 = [Convert]::ToInt32($parts[1],16)
+
+        foreach ($lenPos in @(2,3,4,5)) {
+            $hits = 0
+            $valid = 0
+            $next = 0
+            $examples = New-Object System.Collections.Generic.List[int]
+
+            for ($i=0; $i -lt $Data.Length-8; $i++) {
+                if ($Data[$i] -ne $h0 -or $Data[$i+1] -ne $h1) { continue }
+                $hits++
+
+                $L = [int]$Data[$i+$lenPos]
+                if ($L -gt 200) { continue }
+
+                # Interpret length byte as payload length.
+                $total = $lenPos + 2 + $L
+
+                if ($i+$total -gt $Data.Length) { continue }
+                $valid++
+
+                if ($i+$total+1 -lt $Data.Length -and
+                    $Data[$i+$total] -eq $h0 -and
+                    $Data[$i+$total+1] -eq $h1) {
+                    $next++
+                }
+
+                if ($examples.Count -lt 5) { [void]$examples.Add($L) }
+            }
+
+            if ($hits -ge 3) {
+                $validRatio = [Math]::Round($valid/[double]$hits,3)
+                if ($valid -gt 1) {
+                    $continuity = [Math]::Round($next/[double]($valid-1),3)
+                } else {
+                    $continuity = 0
+                }
+
+                $score = [Math]::Round(
+                    100 * (0.55*$validRatio + 0.45*$continuity),1
+                )
+
+                [void]$models.Add([pscustomobject]@{
+                    Header = $pair.Pair
+                    LenPos = $lenPos
+                    Hits = $hits
+                    Valid = $valid
+                    NextHeader = $next
+                    ValidRatio = $validRatio
+                    Continuity = $continuity
+                    Score = $score
+                    ExampleLengths = ($examples -join ",")
+                })
+            }
+        }
+    }
+
+    @(
+        $models |
+        Sort-Object Score -Descending |
+        Select-Object -First 20
+    )
+}
+
+function Parse-Unknown([byte[]]$Data,$Model) {
+    $parts = $Model.Header.Split(" ")
+    $h0 = [Convert]::ToInt32($parts[0],16)
+    $h1 = [Convert]::ToInt32($parts[1],16)
+
+    $frames = New-Object System.Collections.Generic.List[object]
+
+    for ($i=0; $i -lt $Data.Length-8; $i++) {
+        if ($Data[$i] -ne $h0 -or $Data[$i+1] -ne $h1) { continue }
+
+        $L = [int]$Data[$i+$Model.LenPos]
+        if ($L -gt 200) { continue }
+
+        $total = $Model.LenPos + 2 + $L
+        if ($i+$total -gt $Data.Length) { continue }
+
+        [void]$frames.Add([pscustomobject]@{
+            Offset = $i
+            LengthField = $L
+            Total = $total
+            Bytes = [byte[]]$Data[$i..($i+$total-1)]
+        })
+
+        $i += $total-1
+    }
+
+    @($frames)
+}
+
+function Field-Stats([object[]]$Frames) {
+    if ($Frames.Count -lt 3) { return @() }
+
+    $maxLen = 0
+    foreach ($f in $Frames) {
+        if ($f.Bytes.Length -gt $maxLen) { $maxLen = $f.Bytes.Length }
+    }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    for ($pos=0; $pos -lt $maxLen; $pos++) {
+        $vals = @()
+
+        foreach ($f in $Frames) {
+            if ($pos -lt $f.Bytes.Length) { $vals += [int]$f.Bytes[$pos] }
+        }
+
+        if ($vals.Count -lt 3) { continue }
+
+        $distinct = @($vals | Sort-Object -Unique).Count
+        $min = ($vals | Measure-Object -Minimum).Minimum
+        $max = ($vals | Measure-Object -Maximum).Maximum
+
+        $le = @()
+        $be = @()
+
+        foreach ($f in $Frames) {
+            if ($pos+1 -lt $f.Bytes.Length) {
+                $le += ([int]$f.Bytes[$pos]) -bor (([int]$f.Bytes[$pos+1]) -shl 8)
+                $be += (([int]$f.Bytes[$pos] -shl 8) -bor [int]$f.Bytes[$pos+1])
+            }
+        }
+
+        $constant = ($distinct -eq 1)
+        $constText = ""
+        if ($constant) { $constText = H $vals[0] }
+
+        [void]$rows.Add([pscustomobject]@{
+            Pos = $pos
+            Samples = $vals.Count
+            Distinct = $distinct
+            Min = $min
+            Max = $max
+            Constant = $constant
+            ConstValue = $constText
+            U16LE_Min = ($le | Measure-Object -Minimum).Minimum
+            U16LE_Max = ($le | Measure-Object -Maximum).Maximum
+            U16BE_Min = ($be | Measure-Object -Minimum).Minimum
+            U16BE_Max = ($be | Measure-Object -Maximum).Maximum
+        })
+    }
+
+    @($rows)
+}
+
+function Compare-Frames([object[]]$Base,[object[]]$Action) {
+    $n = [Math]::Min($Base.Count,$Action.Count)
+    if ($n -lt 2) { return @() }
+
+    $maxLen = 0
+    for ($i=0; $i -lt $n; $i++) {
+        $m = [Math]::Min($Base[$i].Bytes.Length,$Action[$i].Bytes.Length)
+        if ($m -gt $maxLen) { $maxLen = $m }
+    }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    for ($pos=0; $pos -lt $maxLen; $pos++) {
+        $changed = 0
+        $examples = New-Object System.Collections.Generic.List[string]
+
+        for ($i=0; $i -lt $n; $i++) {
+            $a = $Base[$i].Bytes
+            $b = $Action[$i].Bytes
+
+            if ($pos -lt $a.Length -and $pos -lt $b.Length -and $a[$pos] -ne $b[$pos]) {
+                $changed++
+                if ($examples.Count -lt 5) {
+                    [void]$examples.Add(("{0:X2}->{1:X2}" -f $a[$pos],$b[$pos]))
+                }
+            }
+        }
+
+        if ($changed -gt 0) {
+            [void]$rows.Add([pscustomobject]@{
+                Position = $pos
+                Changed = $changed
+                Total = $n
+                Fraction = [Math]::Round($changed/[double]$n,3)
+                Examples = ($examples -join ", ")
+            })
+        }
+    }
+
+    @($rows | Sort-Object Fraction -Descending)
+}
+
+try {
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host " JETAUTO / HIWONDER UART PASSIVE RESEARCH" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "Port      : $Port"
+    Write-Host "Device    : $(Get-DeviceName $Port)"
+    Write-Host "Bauds     : $($BaudPlan -join ', ')"
+    Write-Host "Scan time : $ScanSeconds s/profile"
+    Write-Host "Deep time : $DeepSeconds s"
+    Write-Host "Mode      : PASSIVE (RX only)"
+    Write-Host ""
+
+    $ports = [System.IO.Ports.SerialPort]::GetPortNames()
+    if ($ports -notcontains $Port) {
+        throw "COM port $Port not found. Available: $($ports -join ', ')"
+    }
+
+    # --------------------------------------------------
+    # PHASE 1: find the strongest serial profile
+    # --------------------------------------------------
+    Write-Host "PHASE 1 - SERIAL PROFILE SCAN" -ForegroundColor Cyan
+
+    $profiles = New-Object System.Collections.Generic.List[object]
+
+    foreach ($rate in $BaudPlan) {
+        foreach ($par in @("None","Even","Odd")) {
+            $parLetter = "N"
+            if ($par -eq "Even") { $parLetter = "E" }
+            elseif ($par -eq "Odd") { $parLetter = "O" }
+            Write-Host ("Testing {0} / 8{1}1..." -f $rate, $parLetter)
+
+            try {
+                [byte[]]$cap = Capture-Serial $Port $rate $par $ScanSeconds
+                $st = Stats $cap
+                $rrc = @(Parse-RRC $cap)
+                $crc = CRC-MatchRate $rrc
+
+                $rawPath = Join-Path $OutDir ("scan_{0}_{1}.raw" -f $rate,$par)
+                [IO.File]::WriteAllBytes($rawPath,$cap)
+
+                $score = ($rrc.Count*1000) + ($crc.Matches*10000) + ($st.AA55*100) + ($st.Bytes/100.0)
+
+                [void]$profiles.Add([pscustomobject]@{
+                    Baud = $rate
+                    Parity = $par
+                    Bytes = $st.Bytes
+                    AA55 = $st.AA55
+                    CFC = $st.CFC
+                    EFE = $st.EFE
+                    RRC = $rrc.Count
+                    CRC07 = $crc.Matches
+                    Score = [Math]::Round($score,2)
+                    File = $rawPath
+                })
+
+                Write-Host ("  bytes={0,6} AA55={1,4} RRC={2,4} CRC={3,4} 0CFC={4,4} 04FE={5,4} score={6}" -f `
+                    $st.Bytes,$st.AA55,$rrc.Count,$crc.Matches,$st.CFC,$st.EFE,$score)
+            }
+            catch {
+                Write-Host ("  FAILED: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+            }
+        }
+    }
+
+    if ($profiles.Count -eq 0) {
+        throw "No serial profile could be opened."
+    }
+
+    $profiles |
+        Sort-Object Score -Descending |
+        Export-Csv -NoTypeInformation -Path (Join-Path $OutDir "profiles.csv")
+
+    Write-Host ""
+    Write-Host "TOP PROFILES" -ForegroundColor Cyan
+    foreach ($p in $profiles | Sort-Object Score -Descending | Select-Object -First 15) {
+        $pLetter = "N"
+        if ($p.Parity -eq "Even") { $pLetter = "E" }
+        elseif ($p.Parity -eq "Odd") { $pLetter = "O" }
+        Write-Host ("  {0,8} 8{1}1 bytes={2,6} AA55={3,4} RRC={4,4} CRC={5,4} score={6}" -f `
+            $p.Baud,$pLetter,$p.Bytes,$p.AA55,$p.RRC,$p.CRC07,$p.Score)
+    }
+
+    # Use explicit baud if requested, otherwise best structural profile.
+    if ($Baud -gt 0) {
+        $best = $profiles |
+            Where-Object { $_.Baud -eq $Baud -and $_.Parity -eq "None" } |
+            Sort-Object Score -Descending |
+            Select-Object -First 1
+    } else {
+        $best = $profiles |
+            Sort-Object Score -Descending |
+            Select-Object -First 1
+    }
+
+    if ($null -eq $best) {
+        throw "No usable profile selected."
+    }
+
+    # --------------------------------------------------
+    # PHASE 2: deep capture
+    # --------------------------------------------------
+    Write-Host ""
+    $bestLetter = "N"
+    if ($best.Parity -eq "Even") { $bestLetter = "E" }
+    elseif ($best.Parity -eq "Odd") { $bestLetter = "O" }
+    Write-Host ("PHASE 2 - DEEP CAPTURE: {0} / 8{1}1" -f $best.Baud,$bestLetter) -ForegroundColor Cyan
+
+    [byte[]]$deep = Capture-Serial $Port ([int]$best.Baud) $best.Parity $DeepSeconds
+    $deepPath = Join-Path $OutDir "deep.raw"
+    [IO.File]::WriteAllBytes($deepPath,$deep)
+
+    Write-Host "Saved: $deepPath"
+    Write-Host "Bytes: $($deep.Length)"
+
+    if ($deep.Length -eq 0) {
+        throw "Deep capture returned zero bytes."
+    }
+
+    $st = Stats $deep
+
+    Write-Host ""
+    Write-Host "STREAM COUNTS" -ForegroundColor Cyan
+    Write-Host "  AA 55 : $($st.AA55)"
+    Write-Host "  0C FC : $($st.CFC)"
+    Write-Host "  04 FE : $($st.EFE)"
+
+    Write-Host ""
+    Write-Host "FIRST 128 BYTES" -ForegroundColor Cyan
+    $show = [Math]::Min(128,$deep.Length)
+    Write-Host (HX ([byte[]]$deep[0..($show-1)]))
+
+    # --------------------------------------------------
+    # PHASE 3: official RRC
+    # --------------------------------------------------
+    Write-Host ""
+    Write-Host "PHASE 3 - OFFICIAL HIIWONDER RRC" -ForegroundColor Cyan
+    Write-Host "Expected: AA 55 | Function | Length | Data | CRC"
+
+    $rrc = @(Parse-RRC $deep)
+    Write-Host "Complete RRC candidates: $($rrc.Count)"
+
+    if ($rrc.Count -gt 0) {
+        $crc = CRC-MatchRate $rrc
+        Write-Host ("CRC-8/poly07 matches: {0}/{1} ({2})" -f `
+            $crc.Matches,$crc.Samples,$crc.Ratio)
+
+        $rows = foreach ($p in $rrc) {
+            [pscustomobject]@{
+                Offset = $p.Offset
+                Function = ("0x{0:X2}" -f $p.Function)
+                Length = $p.Length
+                Payload = HX $p.Payload
+                CRC = ("0x{0:X2}" -f $p.CRC)
+                Raw = HX $p.Raw
+            }
+        }
+        $rows | Export-Csv -NoTypeInformation -Path (Join-Path $OutDir "rrc_frames.csv")
+
+        Write-Host ""
+        Write-Host "Detected RRC functions:" -ForegroundColor Cyan
+        foreach ($g in $rrc | Group-Object Function | Sort-Object Count -Descending) {
+            Write-Host ("  Function 0x{0:X2} : {1} packet(s)" -f [int]$g.Name,$g.Count)
+        }
+    } else {
+        Write-Host "No complete AA55 RRC packets."
+    }
+
+    # --------------------------------------------------
+    # PHASE 4: unknown framing
+    # --------------------------------------------------
+    Write-Host ""
+    Write-Host "PHASE 4 - UNKNOWN FRAME DISCOVERY" -ForegroundColor Cyan
+
+    $models = @(Find-UnknownModels $deep)
+
+    if ($models.Count -eq 0) {
+        Write-Host "No repeated 2-byte-header + length model found."
+        $bestUnknown = $null
+    } else {
+        foreach ($m in $models | Select-Object -First 15) {
+            Write-Host ("  HEADER={0} LEN@{1} hits={2} valid={3} continuity={4} score={5} lengths={6}" -f `
+                $m.Header,$m.LenPos,$m.Hits,$m.Valid,$m.Continuity,$m.Score,$m.ExampleLengths)
+        }
+
+        $bestUnknown = $models[0]
+
+        if ($bestUnknown.Score -ge 65) {
+            Write-Host ""
+            Write-Host "BEST UNKNOWN MODEL" -ForegroundColor Green
+            Write-Host "  Header : $($bestUnknown.Header)"
+            Write-Host "  Length : byte position $($bestUnknown.LenPos)"
+            Write-Host "  Score  : $($bestUnknown.Score)"
+
+            $frames = @(Parse-Unknown $deep $bestUnknown)
+
+            Write-Host "  Frames : $($frames.Count)"
+
+            if ($frames.Count -ge 3) {
+                $frameRows = foreach ($f in $frames) {
+                    [pscustomobject]@{
+                        Offset = $f.Offset
+                        LengthField = $f.LengthField
+                        Total = $f.Total
+                        Hex = HX $f.Bytes
+                    }
+                }
+                $frameRows | Export-Csv -NoTypeInformation -Path (Join-Path $OutDir "unknown_frames.csv")
+
+                Write-Host ""
+                Write-Host "DETECTED FRAMES" -ForegroundColor Cyan
+                $n = 0
+                foreach ($f in $frames | Select-Object -First 100) {
+                    $n++
+                    $frameHex = HX $f.Bytes
+                    Write-Host ("FRAME {0,3}  offset={1,5} len={2,3}  {3}" -f `
+                        $n,$f.Offset,$f.LengthField,$frameHex)
+                }
+
+                $fields = @(Field-Stats $frames)
+                $fields | Export-Csv -NoTypeInformation -Path (Join-Path $OutDir "unknown_fields.csv")
+
+                Write-Host ""
+                Write-Host "BYTE POSITION STATISTICS" -ForegroundColor Cyan
+                Write-Host "Pos Samples Distinct Min Max Const U16LE[min..max] U16BE[min..max]"
+
+                foreach ($f in $fields) {
+                    Write-Host ("{0,3} {1,7} {2,8} {3,3} {4,3} {5,-5} {6,15} {7,15}" -f `
+                        $f.Pos,$f.Samples,$f.Distinct,$f.Min,$f.Max,$f.ConstValue, `
+                        "$($f.U16LE_Min)..$($f.U16LE_Max)", `
+                        "$($f.U16BE_Min)..$($f.U16BE_Max)")
+                }
+            }
+        }
+    }
+
+    # --------------------------------------------------
+    # PHASE 5: top pairs / old 0CFC hypothesis
+    # --------------------------------------------------
+    Write-Host ""
+    Write-Host "PHASE 5 - TOP BYTE PAIRS" -ForegroundColor Cyan
+
+    foreach ($p in Top-Pairs $deep | Select-Object -First 20) {
+        Write-Host ("  {0} = {1}" -f $p.Pair,$p.Count)
+    }
+
+    if ($st.CFC -gt 0) {
+        Write-Host ""
+        if ($st.EFE -gt ($st.CFC*2)) {
+            Write-Host "0C FC and 04 FE do NOT behave like a simple unique START/END pair in this capture." -ForegroundColor Yellow
+        } else {
+            Write-Host "0C FC / 04 FE occur, but this alone does NOT prove framing." -ForegroundColor Yellow
+        }
+    }
+
+    # --------------------------------------------------
+    # PHASE 6: controlled action experiment
+    # --------------------------------------------------
+    if (-not $NoActions) {
+        Write-Host ""
+        Write-Host "PHASE 6 - CONTROLLED ACTION EXPERIMENT" -ForegroundColor Cyan
+        Write-Host "Passive only. This script never transmits."
+
+        $run = Read-Host "Run one action experiment now? (Y/N)"
+
+        if ($run -match '^[Yy]$') {
+            $label = Read-Host "Action label (example: button_K1 / forward / left)"
+
+            Write-Host ""
+            Write-Host "Leave the robot idle."
+            [void](Read-Host "Press ENTER to capture baseline")
+
+            [byte[]]$base = Capture-Serial $Port ([int]$best.Baud) $best.Parity 3
+            [IO.File]::WriteAllBytes((Join-Path $OutDir "action_baseline.raw"),$base)
+
+            Write-Host ""
+            Write-Host "Now press ENTER, then immediately perform: $label"
+            [void](Read-Host "READY")
+
+            [byte[]]$act = Capture-Serial $Port ([int]$best.Baud) $best.Parity 3
+            [IO.File]::WriteAllBytes((Join-Path $OutDir "action.raw"),$act)
+
+            if ($null -ne $bestUnknown -and $bestUnknown.Score -ge 65) {
+                $bf = @(Parse-Unknown $base $bestUnknown)
+                $af = @(Parse-Unknown $act $bestUnknown)
+                $diff = @(Compare-Frames $bf $af)
+
+                $diff | Export-Csv -NoTypeInformation `
+                    -Path (Join-Path $OutDir "action_position_changes.csv")
+
+                Write-Host ""
+                Write-Host "POSITIONS CHANGED DURING ACTION: $label" -ForegroundColor Cyan
+                foreach ($d in $diff | Select-Object -First 40) {
+                    Write-Host ("  pos={0,3} changed={1,3}/{2,3} frac={3}  {4}" -f `
+                        $d.Position,$d.Changed,$d.Total,$d.Fraction,$d.Examples)
+                }
+            } else {
+                Write-Host "No high-confidence unknown frame model; raw baseline/action captures were saved."
+            }
+        }
+    }
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "DONE" -ForegroundColor Cyan
+    Write-Host "Artifacts: $((Resolve-Path $OutDir).Path)"
+    Write-Host "============================================================" -ForegroundColor Cyan
+}
+finally {
+    try { Stop-Transcript | Out-Null } catch {}
+}
+
+'@ | Set-Content -Encoding UTF8 .\jetauto_uart_final_PS51.ps1
+PS C:\Users\William Anthony\Downloads> Set-ExecutionPolicy -Scope Process Bypass
+PS C:\Users\William Anthony\Downloads> .\jetauto_uart_final_PS51.ps1 -Port COM9
+============================================================
+ JETAUTO / HIWONDER UART PASSIVE RESEARCH
+============================================================
+Port      : COM9
+Device    : USB-Enhanced-SERIAL CH9102 (COM9)
+Bauds     : 115200, 230400, 460800, 921600, 1000000, 1500000, 2000000, 3000000, 4000000
+Scan time : 1 s/profile
+Deep time : 8 s
+Mode      : PASSIVE (RX only)
+
+PHASE 1 - SERIAL PROFILE SCAN
+Testing 115200 / 8N1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 115200 / 8E1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 115200 / 8O1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 230400 / 8N1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 230400 / 8E1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 230400 / 8O1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 460800 / 8N1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 460800 / 8E1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 460800 / 8O1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 921600 / 8N1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 921600 / 8E1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 921600 / 8O1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 1000000 / 8N1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 1000000 / 8E1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 1000000 / 8O1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 1500000 / 8N1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 1500000 / 8E1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 1500000 / 8O1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 2000000 / 8N1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 2000000 / 8E1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 2000000 / 8O1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 3000000 / 8N1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 3000000 / 8E1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 3000000 / 8O1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 4000000 / 8N1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 4000000 / 8E1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+Testing 4000000 / 8O1...
+PS C:\Users\William Anthony\Downloads> TerminatingError(): "Argument types do not match"
+  FAILED: Argument types do not match
+**********************
+PowerShell transcript end
+End time: 20261003201034
+**********************
